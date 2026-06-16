@@ -21,8 +21,8 @@ A CLI-based personal finance agent styled after the gitlab-cli REPL. It ingests 
 
 - Investments (MF, stocks, FD/RD) — deferred to v0.2
 - Broker API integrations
-- Multi-user support
-- Web/mobile UI (consumed via iData-UI later)
+- Multi-user support (single user; `user_id` field exists for future-proofing)
+- iData-UI mobile app integration (deferred to P8; embedded web dashboard is in-scope at P7)
 
 ---
 
@@ -72,6 +72,9 @@ finance-agent/
 │   ├── repl_prompts.go             # Interactive prompt helpers
 │   └── daemon.go                   # Background polling mode
 │
+├── data/                           # Runtime data (gitignored)
+│   └── brain.model                 # Persisted ML model file
+│
 ├── pkg/
 │   ├── config/
 │   ├── db/
@@ -79,7 +82,10 @@ finance-agent/
 │   │   ├── accounts.go
 │   │   ├── transactions.go
 │   │   ├── cards.go
-│   │   └── categories.go
+│   │   ├── categories.go
+│   │   ├── training.go             # training_data + merchant_memory CRUD
+│   │   ├── brain_metrics.go        # brain_metrics snapshots
+│   │   └── sync_state.go           # sync_state + ignored_accounts
 │   ├── sources/
 │   │   ├── source.go               # Source interface
 │   │   ├── gmail/
@@ -159,7 +165,9 @@ finance-agent/
 | `counterparty_upi` | string | UPI ID if available |
 | `source` | string | "gmail_alert", "statement_pdf" |
 | `source_ref` | string | Email message ID / file hash |
-| `categorized_by` | string | "rule", "ai", "manual" |
+| `categorized_by` | string | "memory", "fuzzy", "ml", "pattern", "ai", "manual" |
+| `confidence` | float64 | Categorization confidence score (0.0-1.0) |
+| `review_status` | string | "auto_accepted", "confirmed", "corrected", "pending_review" |
 | `is_recurring` | bool | Recurring transaction flag |
 | `created_at` | time | Record creation time |
 
@@ -217,6 +225,69 @@ finance-agent/
 | `status` | string | idle, syncing, error |
 
 **Unique index**: `(user_id, source)`
+
+### Collection: `training_data`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `_id` | ObjectID | Auto-generated |
+| `user_id` | string | Owner |
+| `description` | string | Normalized transaction description |
+| `category` | string | Confirmed category |
+| `sub_category` | string | Confirmed sub-category |
+| `weight` | float64 | Training weight (corrections=10, confirms=1, AI=0.5, seed=0.3) |
+| `source` | string | "user_correct", "user_confirm", "ai_accepted", "seed" |
+| `created_at` | time | When this entry was added |
+
+**Index**: `(user_id, category)`, `(user_id, created_at)`
+
+### Collection: `merchant_memory`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `_id` | ObjectID | Auto-generated |
+| `user_id` | string | Owner |
+| `normalized_key` | string | Normalized merchant description (lowercased, trimmed) |
+| `original_description` | string | Original description that created this entry |
+| `category` | string | Mapped category |
+| `sub_category` | string | Mapped sub-category |
+| `hit_count` | int64 | Times this entry matched (for confidence) |
+| `last_hit` | time | Last time this was used |
+| `created_at` | time | Entry creation |
+
+**Unique index**: `(user_id, normalized_key)`
+
+### Collection: `brain_metrics`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `_id` | ObjectID | Auto-generated |
+| `user_id` | string | Owner |
+| `date` | time | Metrics snapshot date |
+| `total_predictions` | int64 | Cumulative predictions |
+| `auto_accepted` | int64 | High-confidence auto-accepts |
+| `user_confirmed` | int64 | Explicit confirmations |
+| `user_corrected` | int64 | Corrections |
+| `overall_accuracy` | float64 | Computed accuracy |
+| `category_accuracy` | map | Per-category accuracy |
+| `ai_calls` | int64 | AI API calls this period |
+| `model_size` | int64 | Training data count |
+| `merchant_count` | int64 | Merchant memory entries |
+
+**Index**: `(user_id, date)` descending
+
+### Collection: `ignored_accounts`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `_id` | ObjectID | Auto-generated |
+| `user_id` | string | Owner |
+| `bank_name` | string | Bank |
+| `account_number` | string | Last 4 digits |
+| `reason` | string | "user_declined" or "duplicate" |
+| `detected_at` | time | When first seen |
+
+**Unique index**: `(user_id, bank_name, account_number)`
 
 ### Default Categories (seeded)
 
@@ -281,6 +352,7 @@ finance-agent/
 
 | Command | Description |
 |---------|-------------|
+| `gmail-auth` | Run OAuth2 browser flow (first-time or re-auth) |
 | `sync` | Pull new Gmail emails, parse & store |
 | `sync-status` | Last sync time, counts, errors |
 | `sync-history` | Sync run history |
@@ -495,21 +567,24 @@ func (c *LocalClassifier) Retrain(allData []TrainingEntry)
 
 ### Layer 5: NVIDIA AI Fallback (diminishing use)
 
-- Only triggered when local ML confidence < `categories.min_confidence` (default 0.7)
+- Only triggered when local ML confidence < `categories.ai_threshold` (default 0.6)
 - Batch up to 10 txns per API call
 - After AI categorizes → feeds back into Layer 1 + Layer 3 training data
 - Prompt: "Should I remember: DECATHLON → Shopping? [y/n]" → creates persistent entry
 
 ### Confidence Scoring
 
-| Source | Confidence | User Action |
-|--------|-----------|-------------|
-| Merchant Memory (exact) | 0.99 | Auto-accept, no prompt |
-| Fuzzy Match | 0.85-0.95 | Auto-accept, no prompt |
-| Local ML (high) | 0.80-0.95 | Auto-accept, shown in sync output |
-| Local ML (medium) | 0.60-0.80 | Accept but flag for review |
-| AI fallback | 0.70-0.90 | Accept, prompt to create rule |
-| No match | 0.0 | Mark "Uncategorized", ask user |
+| Source | Confidence | User Action | `review_status` |
+|--------|-----------|-------------|-----------------|
+| Merchant Memory (exact) | 0.99 | Auto-accept, no prompt | `auto_accepted` |
+| Fuzzy Match | 0.85-0.95 | Auto-accept, no prompt | `auto_accepted` |
+| Local ML (high) | ≥ 0.80 | Auto-accept, shown in sync output | `auto_accepted` |
+| Local ML (medium) | 0.60-0.80 | Category assigned but flagged for review | `pending_review` |
+| AI fallback | 0.60-0.90 | Category assigned, prompt to confirm | `pending_review` |
+| Below ai_threshold | < 0.60 | Trigger AI; if AI also low → uncategorized | `pending_review` |
+| No match anywhere | 0.0 | Mark "Uncategorized", ask user | `pending_review` |
+
+**Key behavior**: Transactions with `pending_review` status still have their best-guess category assigned (so analytics aren't empty), but they appear in the `review` queue. Users can confirm or correct them.
 
 ### Training Data
 
@@ -835,7 +910,8 @@ parsers:
 
 categories:
   auto_learn: true
-  min_confidence: 0.8
+  min_confidence: 0.8       # above this: auto-accept. Below: queue for review
+  ai_threshold: 0.6         # below this: trigger AI fallback
 ```
 
 ---
@@ -846,13 +922,14 @@ categories:
 |-------|-------|-------------------------------|
 | **P0** | Skeleton — REPL, config, MongoDB, themed output | `start`, `config`, `help`, `exit` |
 | **P1** | Accounts — CRUD, balance display, overview | `accounts`, `account-add`, `balance`, `overview` |
-| **P2** | Gmail Sync — OAuth, fetch, HDFC parser, store | `sync`, `sync-status`, `txns` |
-| **P3** | Categorization — rules, seeds, manual, categories | `categories`, `category-add`, `txn-categorize`, `spend` |
-| **P4** | Credit Cards — model, bill parsing, dues | `cards`, `card-add`, `card-bill`, `card-due` |
-| **P5** | AI + Polish — NVIDIA fallback, learning, trends | `recategorize`, `spend-trend`, `monthly` |
-| **P6** | Daemon — background polling, Docker, import | `daemon-start`, `import` |
-| **P7** | Embedded UI — built-in web dashboard | `localhost:3000` dashboard |
-| **P8** | iData-UI Integration — REST API for mobile app (future) | — |
+| **P2** | Gmail Sync — OAuth, fetch, HDFC parser, auto-detect, store | `gmail-auth`, `sync`, `sync-status`, `txns` |
+| **P3** | Categorization — merchant memory, fuzzy, seeds, manual override | `categories`, `category-add`, `txn-categorize`, `spend` |
+| **P4** | Brain ML — local classifier, training, review, QA, accuracy | `train`, `review`, `brain-status`, `recategorize` |
+| **P5** | Credit Cards — model, bill parsing, dues | `cards`, `card-add`, `card-bill`, `card-due` |
+| **P6** | AI + Polish — NVIDIA fallback, learning loop, trends | `spend-trend`, `monthly`, NL fallback |
+| **P7** | Daemon — background polling, Docker, import | `daemon-start`, `import` |
+| **P8** | Embedded UI — built-in web dashboard | `localhost:3000` dashboard |
+| **P9** | iData-UI Integration — REST API for mobile app (future) | — |
 
 ---
 
