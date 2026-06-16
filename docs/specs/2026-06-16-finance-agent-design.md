@@ -125,6 +125,8 @@ finance-agent/
 | `currency` | string | "INR" |
 | `last_updated` | time | Last balance update |
 | `is_active` | bool | Active flag |
+| `is_confirmed` | bool | User confirmed tracking (auto-detect flow) |
+| `detected_from` | string | Source that first detected this account |
 | `metadata` | map | IFSC, branch, etc. |
 
 **Unique index**: `(user_id, bank_name, account_number)`
@@ -315,7 +317,15 @@ Unrecognized input → NVIDIA AI intent classification → route to command or f
 
 ### Gmail Source
 
-**Auth**: OAuth2 with offline refresh token (one-time browser consent via `gmail-auth` command).
+**Auth**: OAuth2 with offline refresh token.
+
+**Authentication lifecycle**:
+
+1. **First run**: `gmail-auth` command opens browser for Google consent. User grants Gmail read access. Agent receives access token + refresh token, stores both in `token.json`.
+2. **Subsequent runs**: Agent loads `token.json`, uses refresh token to silently obtain a new access token. No browser interaction needed. Token refresh happens automatically before expiry.
+3. **Token revoked/expired**: If refresh token is invalid (user revoked in Google settings, or token expired after 6 months of inactivity), agent catches the error and prompts: "Gmail auth expired. Re-authenticate? [y/n]" → re-runs browser OAuth flow.
+4. **Auth failure (network, denied, etc.)**: Agent starts in offline mode. REPL commands for viewing stored data work normally. Only sync commands (`sync`, `daemon-start`) fail with: "Gmail unavailable — working in offline mode. Run `gmail-auth` to reconnect."
+5. **Daemon mode auth failure**: Logs error, retries next poll cycle. After 3 consecutive failures, pauses polling and logs warning.
 
 **Initial Sync (first run)**:
 - During `start` / `gmail-auth`, prompt user: "Sync emails from when? [1 month / 3 months / 6 months / 1 year / all]"
@@ -337,11 +347,38 @@ Gmail API → Fetch bank emails
     → Identify bank (from address)
     → Route to bank parser
     → Extract transaction data
+    → Auto-detect account/card (see below)
     → Deduplicate (reference + amount + date)
     → Run categorization
     → Store in MongoDB
     → Update account balance
 ```
+
+### Account & Card Auto-Detection
+
+Bank accounts and credit cards are **not** pre-configured — they are discovered from email data:
+
+**Auto-detection flow**:
+```
+Email parsed → contains account number (last 4 digits) + bank name
+    → Check if account exists in DB
+    → If new account found:
+        → Prompt user: "Detected HDFC Savings ****4521. Track this account? [y/n]"
+        → If yes: create account record, set initial balance from email
+        → If no: add to ignore list (won't prompt again)
+    → If known account: update balance from email
+```
+
+**Same for credit cards**:
+```
+Card transaction email → contains card last 4 digits
+    → "Detected HDFC Credit Card ****7788. Track this card? [y/n]"
+    → If yes: create card record
+```
+
+**Manual override**: Users can also `account-add` / `card-add` manually (for accounts that don't have email alerts enabled yet, or to pre-configure before first sync).
+
+**Daemon mode auto-detect**: In headless daemon mode, new accounts are auto-created with `is_confirmed: false` flag. On next REPL session, user is prompted to confirm/reject pending accounts.
 
 ### HDFC Email Templates
 
