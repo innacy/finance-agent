@@ -90,9 +90,14 @@ finance-agent/
 │   │       ├── statement.go
 │   │       └── templates.go
 │   ├── categorization/
-│   │   ├── engine.go
-│   │   ├── rules.go
-│   │   └── ai.go
+│   │   ├── engine.go               # Multi-layer pipeline orchestrator
+│   │   ├── memory.go               # Layer 1: Merchant memory (exact match)
+│   │   ├── fuzzy.go                # Layer 2: Fuzzy string matching
+│   │   ├── classifier.go           # Layer 3: Naive Bayes ML classifier
+│   │   ├── patterns.go             # Layer 4: Recurring/time/amount heuristics
+│   │   ├── ai.go                   # Layer 5: NVIDIA AI fallback
+│   │   ├── training.go             # Training data management & retraining
+│   │   └── seeds.go                # Built-in merchant seed data
 │   ├── ai/
 │   ├── output/
 │   └── utils/
@@ -407,43 +412,154 @@ Card transaction email → contains card last 4 digits
 
 ---
 
-## Categorization Engine
+## Categorization Engine (The Learning Brain)
 
-### Pipeline (in order)
+The categorization engine is a multi-layer pipeline. Each layer is faster and cheaper
+than the next. As the system learns from user behavior, more transactions are caught
+by the upper (cheaper) layers, and the expensive AI fallback diminishes over time.
 
-1. **Exact UPI ID match** — `counterparty_upi` → category rule
-2. **Merchant name match** — substring/regex against description
-3. **Keyword match** — known patterns (SWIGGY, UBER, etc.)
-4. **Channel heuristic** — ATM → Cash, NEFT on salary day → Income
-5. **NVIDIA AI fallback** — batch up to 10 txns per call
+### Multi-Layer Pipeline
 
-### Rule Storage
+```
+Layer 1: Merchant Memory     [instant, O(1) lookup]
+    ↓ no match
+Layer 2: Fuzzy Match         [~1ms, string similarity]
+    ↓ no match
+Layer 3: Local ML Classifier [~5ms, no API, trained on YOUR data]
+    ↓ low confidence
+Layer 4: Pattern Detection   [heuristics: recurring, time-based, amount-based]
+    ↓ no match
+Layer 5: NVIDIA AI Fallback  [expensive, last resort — decreases over time]
+```
 
-Rules in MongoDB `categories` collection, cached in memory. Sorted by priority.
+### Layer 1: Merchant Memory (exact match)
 
-### Built-in Seed Rules
+Stored in MongoDB, cached in memory at startup. Every confirmed categorization adds an entry.
 
-| Pattern | Match Type | Category |
-|---------|-----------|----------|
-| swiggy, zomato | keyword | Food & Dining / Delivery |
-| uber, ola, rapido | keyword | Transport / Cab |
-| amazon, flipkart | keyword | Shopping / Online |
-| netflix, hotstar, spotify | keyword | Entertainment / Streaming |
-| NEFT-SALARY, SAL- | keyword | Income / Salary |
-| LIC, insurance | keyword | Bills / Insurance |
-| electricity, BESCOM | keyword | Bills / Electricity |
+```go
+type MerchantMemory struct {
+    entries map[string]string  // normalized description → category
+    upiMap  map[string]string  // UPI ID → category
+}
+```
 
-### AI Fallback
+After 3 months of use, catches 70-80% of transactions alone.
 
-- Send description + amount + channel to NVIDIA AI
-- Parse JSON response `{"category": "...", "sub_category": "..."}`
-- Batch uncategorized (up to 10 per call)
-- Cache: same merchant → same category
+### Layer 2: Fuzzy Match (string similarity)
 
-### Learning Loop
+Handles merchant name variations:
+- "SWIGGY BANGALORE", "SWIGGY MUMBAI", "SWIGGY 12345" all match known "SWIGGY"
+- Levenshtein distance / token overlap
+- Threshold: 85% similarity → same category as matched merchant
 
-After AI categorizes → prompt user: "Create rule for X → Category? [y/n]"
-If yes → persist rule → no AI call next time for same merchant.
+### Layer 3: Local Naive Bayes Classifier (the core brain)
+
+TF-IDF Naive Bayes classifier trained on user's own transaction history.
+
+**Library**: [`jbrukh/bayesian`](https://github.com/jbrukh/bayesian) (812 stars, Go native, TF-IDF, persistence)
+
+```go
+type LocalClassifier struct {
+    model      *bayesian.Classifier
+    categories []bayesian.Class
+    dataFile   string  // persisted model file
+}
+
+func (c *LocalClassifier) Predict(description string) (category string, confidence float64)
+func (c *LocalClassifier) Train(description string, category string, weight float64)
+func (c *LocalClassifier) Retrain(allData []TrainingEntry)
+```
+
+- Retrained incrementally on every confirmation/correction
+- After ~200 transactions, reaches 85-90% accuracy for unknowns
+- No external API needed — runs in-process in Go
+
+### Layer 4: Pattern Detection (heuristics)
+
+- Same amount + same merchant + regular interval → recurring (subscription/EMI)
+- Salary-day credits (same day each month, large amount) → Income
+- ATM round amounts → Cash Withdrawal
+- Channel-based: NEFT on salary day → Income
+
+### Layer 5: NVIDIA AI Fallback (diminishing use)
+
+- Only triggered when local ML confidence < `categories.min_confidence` (default 0.7)
+- Batch up to 10 txns per API call
+- After AI categorizes → feeds back into Layer 1 + Layer 3 training data
+- Prompt: "Should I remember: DECATHLON → Shopping? [y/n]" → creates persistent entry
+
+### Confidence Scoring
+
+| Source | Confidence | User Action |
+|--------|-----------|-------------|
+| Merchant Memory (exact) | 0.99 | Auto-accept, no prompt |
+| Fuzzy Match | 0.85-0.95 | Auto-accept, no prompt |
+| Local ML (high) | 0.80-0.95 | Auto-accept, shown in sync output |
+| Local ML (medium) | 0.60-0.80 | Accept but flag for review |
+| AI fallback | 0.70-0.90 | Accept, prompt to create rule |
+| No match | 0.0 | Mark "Uncategorized", ask user |
+
+### Training Data
+
+```go
+type TrainingEntry struct {
+    Description string
+    Category    string
+    Weight      float64   // corrections=10x, confirms=1x, AI=0.5x, seed=0.3x
+    Source      string    // "user_correct", "user_confirm", "ai_accepted", "seed"
+    CreatedAt   time.Time
+}
+```
+
+### Built-in Seed Data (~300 Indian merchants)
+
+Shipped with binary for day-0 functionality:
+
+| Pattern | Category |
+|---------|----------|
+| swiggy, zomato, dominos | Food & Dining / Delivery |
+| uber, ola, rapido | Transport / Cab |
+| amazon, flipkart, myntra | Shopping / Online |
+| netflix, hotstar, spotify | Entertainment / Streaming |
+| NEFT-SALARY, SAL- | Income / Salary |
+| LIC, insurance | Bills / Insurance |
+| electricity, BESCOM, MSEDCL | Bills / Electricity |
+| phonepe, gpay, paytm (transfer) | Transfers |
+
+### Retraining Strategy
+
+| Trigger | Action |
+|---------|--------|
+| Every 50 new confirmed transactions | Incremental retrain |
+| User runs `recategorize` | Full retrain + re-predict uncategorized |
+| Monthly (daemon mode) | Full retrain on all accumulated data |
+| User corrects a prediction | Immediate incremental update |
+
+### Expected Improvement Timeline
+
+```
+Week 1:   ~40% auto-categorized (seeds + first confirmations)
+Week 2:   ~60% (merchant memory growing, ML has ~100 examples)
+Month 1:  ~80% (ML confident, most regular merchants known)
+Month 3:  ~92% (fuzzy catches variations, patterns detected)
+Month 6:  ~97% (AI barely needed, only truly new merchants)
+```
+
+### User Overrides
+
+- `txn-categorize` — manually set category → feeds merchant memory + training data (10x weight)
+- Manual categorization always wins over all layers
+- `recategorize` — re-runs full pipeline on uncategorized transactions
+
+### Open Source References
+
+| Project | Architecture | URL |
+|---------|-------------|-----|
+| **Spectra** | Memory → Fuzzy → TF-IDF+LogReg → API. Corrections 10x weight. | [github](https://github.com/francescogabrieli/Spectra) |
+| **FafyCat** | Local ML, active learning, >90% accuracy | [github](https://github.com/davidchris/fafycat) |
+| **NumbyAI** | Rules → Local LLM (Ollama), batch processing | [github](https://github.com/RoXsaita/NumbyAI-Public) |
+| **MoneyPulse** | 60+ seed rules, learning engine, local Ollama | [github](https://github.com/ManikantaR/MoneyPulse) |
+| **jbrukh/bayesian** | Go Naive Bayes + TF-IDF (core ML library) | [github](https://github.com/jbrukh/bayesian) |
 
 ---
 
