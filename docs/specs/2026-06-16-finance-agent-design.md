@@ -66,6 +66,7 @@ finance-agent/
 │   ├── repl_sync.go                # Sync commands
 │   ├── repl_overview.go            # Overview & analytics
 │   ├── repl_category.go            # Category management
+│   ├── repl_brain.go               # Brain status, review, train commands
 │   ├── repl_config.go              # Config display
 │   ├── repl_helpers.go             # Shared utilities
 │   ├── repl_prompts.go             # Interactive prompt helpers
@@ -303,6 +304,17 @@ finance-agent/
 | `category-edit` | Modify rule |
 | `category-remove` | Remove rule |
 | `recategorize` | Re-run engine on uncategorized txns |
+
+### Brain (`repl_brain.go`)
+
+| Command | Description |
+|---------|-------------|
+| `brain-status` | Accuracy, model size, AI dependency stats |
+| `review` | Batch review uncertain transactions |
+| `train` | Quiz-style training session on weak spots |
+| `brain-reset` | Reset model (rebuilds from training data) |
+| `brain-export` | Export training data as JSON |
+| `brain-import` | Import training data |
 
 ### Daemon
 
@@ -560,6 +572,179 @@ Month 6:  ~97% (AI barely needed, only truly new merchants)
 | **NumbyAI** | Rules → Local LLM (Ollama), batch processing | [github](https://github.com/RoXsaita/NumbyAI-Public) |
 | **MoneyPulse** | 60+ seed rules, learning engine, local Ollama | [github](https://github.com/ManikantaR/MoneyPulse) |
 | **jbrukh/bayesian** | Go Naive Bayes + TF-IDF (core ML library) | [github](https://github.com/jbrukh/bayesian) |
+
+---
+
+## Brain Persistence & QA Training
+
+### How the Brain Persists Across Sessions
+
+Two-layer persistence ensures no training data is ever lost:
+
+| What | Where | Why |
+|------|-------|-----|
+| Training data (source of truth) | MongoDB `training_data` collection | Durable, queryable, survives model corruption |
+| Compiled ML model (fast load) | Local file `./data/brain.model` | Fast startup without retraining |
+| Merchant memory | MongoDB `merchant_memory` collection | Exact lookups, persists across restarts |
+| Brain metrics history | MongoDB `brain_metrics` collection | Track improvement over time |
+
+**Startup flow**:
+```
+Agent starts
+    → Load brain.model file (pre-compiled Naive Bayes)
+    → If file missing/corrupt: rebuild from training_data collection
+    → Load merchant_memory into RAM cache
+    → Ready to categorize
+```
+
+**After training updates**:
+```
+User confirms/corrects
+    → Write to training_data (MongoDB)
+    → Update merchant_memory (MongoDB + RAM cache)
+    → Incrementally update in-memory model
+    → Every 50 updates: persist brain.model to disk
+```
+
+Even if the model file is deleted, the brain fully rebuilds from MongoDB training data.
+
+### QA Training Interactions (Active Learning)
+
+Three modes, all feeding the same training pipeline:
+
+**Mode A: Inline during sync** (automatic, low-friction)
+
+After `sync`, show uncertain predictions:
+```
+finance-agent > sync
+✓ 12 new transactions processed
+✓ 9 auto-categorized (confidence > 0.8)
+⚠ 3 need review:
+
+  1. RAPIDO_TRIP_4821 ₹89    → Transport/Cab [0.72]  Agree? [y/n/c]
+  2. FRESHWORKS_SAS  ₹4,999  → AI says: Bills/SaaS [0.65]  Agree? [y/n/c]
+  3. UPI-RAVI_KUMAR  ₹2,000  → Uncategorized         Category? [type or skip]
+```
+
+- `y` = confirm (1x weight)
+- `n` = reject, type correct category (10x weight)
+- `c` = change to different category (shows list)
+- `skip` / Enter = defer to review queue
+
+**Mode B: Review queue** (batch, when user has time)
+
+Uncertain transactions accumulate silently. User runs `review`:
+```
+finance-agent > review
+📋 14 transactions pending review (oldest: 3 days ago)
+
+  [1/14] Jun 14 | RAZORPAY_PMT ₹1,200 | Debit
+         AI suggests: Shopping [0.55]
+         Your call: [1]Shopping [2]Bills [3]Subscription [4]Other [5]Skip
+```
+
+- Shows AI suggestion with confidence score
+- Most uncertain first (maximizes learning per interaction)
+- `review --all` for all including auto-categorized
+- `review --category food` for specific category
+
+**Mode C: Dedicated `train` command** (focused learning)
+
+Quiz-style session targeting weak spots:
+```
+finance-agent > train
+🧠 Brain Training Session
+   Current accuracy: 84% | 342 training points
+   Weakest: Subscriptions (62%), Transfers (71%)
+
+  Q1: "PAYTM_POSTPAID ₹499" — recurring monthly
+      Brain thinks: Bills/Mobile [0.58]
+      Correct? [y] or what is it? > Subscription
+      ✓ Learned! Subscriptions: 62% → 64%
+
+  Q2: "UPI-JOHN_DOE ₹5,000"
+      Brain thinks: Transfers/Sent [0.73]
+      Correct? [y] > y
+      ✓ Confirmed!
+
+  Session: 10 questions, 8 confirmed, 2 corrected
+  Accuracy: 84% → 86%
+```
+
+The `train` command picks questions by:
+1. Lowest confidence predictions
+2. Worst-performing categories
+3. Recently corrected patterns (verify learning)
+
+### Accuracy Measurement
+
+**Self-measured against user feedback**:
+
+```go
+type BrainMetrics struct {
+    TotalPredictions      int64
+    AutoAccepted          int64   // high confidence, user never corrected
+    UserConfirmed         int64   // user explicitly said yes
+    UserCorrected         int64   // user changed the category
+    OverallAccuracy       float64 // (auto_accepted + confirmed) / total
+    CategoryAccuracy      map[string]float64
+    ConfidenceCalibration float64 // calibration score
+    AICallsThisMonth      int64
+    AICallsLastMonth      int64
+    LastCalculated        time.Time
+}
+```
+
+**Formula**: `accuracy = (auto_accepted_never_corrected + user_confirmed) / total`
+
+If user later corrects an auto-accepted transaction, accuracy adjusts retroactively.
+
+**`brain-status` command**:
+```
+finance-agent > brain-status
+╭────────────────────────────────────────╮
+│           🧠 Brain Status              │
+├────────────────────────────────────────┤
+│  Overall Accuracy:    87.3%            │
+│  Auto-categorized:    82% of txns      │
+│  Model size:          456 training pts  │
+│  Merchant memory:     189 merchants     │
+│  Corrections (month): 12               │
+│  AI calls (month):    8 (↓ from 34)    │
+│  Pending review:      5 transactions    │
+├────────────────────────────────────────┤
+│  Weakest:  Subscriptions 68%           │
+│  Strongest: Food & Dining 96%          │
+╰────────────────────────────────────────╯
+```
+
+### Benchmark & Reference Datasets
+
+| Dataset | Records | Categories | Relevance |
+|---------|---------|-----------|-----------|
+| [mitulshah/transaction-categorization](https://huggingface.co/datasets/mitulshah/transaction-categorization) | 4.5M | 10 | Includes India/INR data, good seed benchmark |
+| [DoDataThings/us-bank-transaction-categories-v2](https://huggingface.co/datasets/DoDataThings/us-bank-transaction-categories-v2) | 68K | 17 | DistilBERT achieves 96% real-world |
+| [MoneyData (Mendeley)](https://data.mendeley.com/datasets/dnxtg6n4rv/1) | 6,500 | — | Real 7-year transaction data |
+| [FinBen (NeurIPS 2024)](https://proceedings.neurips.cc/paper_files/paper/2024/file/adb1d9fa8be4576d28703b396b82ba1b-Paper-Datasets_and_Benchmarks_Track.pdf) | 42 datasets | 24 tasks | Holistic financial LLM benchmark |
+
+**Industry accuracy targets**:
+- Cold start (week 1): 40-50%
+- Trained on user data (month 1): 80-85%
+- Mature (month 3+): 90-95%
+- FafyCat reference: >90% with active learning
+
+**Recommended evaluation metrics**: F1 score (macro), per-category precision/recall, confidence calibration.
+
+### Additional CLI Commands (Brain Management)
+
+| Command | Description |
+|---------|-------------|
+| `brain-status` | Accuracy, model size, weak categories, AI dependency |
+| `review` | Batch review uncertain transactions |
+| `train` | Quiz-style focused training session |
+| `brain-reset` | Reset model (keeps training data, rebuilds from scratch) |
+| `brain-export` | Export training data as JSON (backup/portability) |
+| `brain-import` | Import training data (restore/seed from dataset) |
 
 ---
 
