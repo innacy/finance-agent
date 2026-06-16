@@ -317,11 +317,18 @@ Unrecognized input → NVIDIA AI intent classification → route to command or f
 
 **Auth**: OAuth2 with offline refresh token (one-time browser consent via `gmail-auth` command).
 
-**Polling**:
-- Query: `from:(alerts@hdfcbank.net) newer_than:1d`
-- Track `lastMessageID` in sync_state
-- Daemon: poll every 5 minutes (configurable)
-- REPL `sync`: immediate pull
+**Initial Sync (first run)**:
+- During `start` / `gmail-auth`, prompt user: "Sync emails from when? [1 month / 3 months / 6 months / 1 year / all]"
+- Fetch all matching bank emails from chosen date onwards
+- Process in batches (50 at a time) to avoid memory pressure
+- Store the oldest processed timestamp as baseline in `sync_state`
+
+**Subsequent Syncs (incremental)**:
+- Query Gmail API with: `from:(alerts@hdfcbank.net) after:<last_sync_timestamp>`
+- Only fetches emails newer than `sync_state.last_sync_time`
+- Daemon: polls every 5 minutes (configurable)
+- REPL `sync`: immediate incremental pull
+- If sync gap > 7 days (e.g. agent was offline), warn user and offer backfill
 
 **Processing flow**:
 
