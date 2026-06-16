@@ -497,8 +497,8 @@ categories:
 
 ## Implementation Phases
 
-| Phase | Scope | Working Commands |
-|-------|-------|-----------------|
+| Phase | Scope | Working Commands / Deliverable |
+|-------|-------|-------------------------------|
 | **P0** | Skeleton — REPL, config, MongoDB, themed output | `start`, `config`, `help`, `exit` |
 | **P1** | Accounts — CRUD, balance display, overview | `accounts`, `account-add`, `balance`, `overview` |
 | **P2** | Gmail Sync — OAuth, fetch, HDFC parser, store | `sync`, `sync-status`, `txns` |
@@ -506,7 +506,8 @@ categories:
 | **P4** | Credit Cards — model, bill parsing, dues | `cards`, `card-add`, `card-bill`, `card-due` |
 | **P5** | AI + Polish — NVIDIA fallback, learning, trends | `recategorize`, `spend-trend`, `monthly` |
 | **P6** | Daemon — background polling, Docker, import | `daemon-start`, `import` |
-| **P7** | API Layer — REST for iData-UI (future) | — |
+| **P7** | Embedded UI — built-in web dashboard | `localhost:3000` dashboard |
+| **P8** | iData-UI Integration — REST API for mobile app (future) | — |
 
 ---
 
@@ -536,6 +537,154 @@ Production: Atlas connection string in config
 
 - API key from NVIDIA AI Endpoints or build.nvidia.com
 - Set as `NVIDIA_API_KEY` env variable
+
+---
+
+## Embedded UI (Phase 7)
+
+### Overview
+
+A lightweight web dashboard built into the finance-agent binary itself. Provides visual access to all financial data without needing the full iData-UI mobile app. The Go agent serves both the API and the static frontend.
+
+### Tech Stack
+
+| Layer | Choice | Reason |
+|-------|--------|--------|
+| Frontend | Vite + React + TypeScript | Fast DX, strong typing, huge ecosystem |
+| Styling | Tailwind CSS | Utility-first, no custom CSS maintenance |
+| Charts | Recharts or Chart.js | Category breakdown, spend trends |
+| HTTP client | fetch / TanStack Query | Simple data fetching with caching |
+| Build output | Static files (`dist/`) | Embeddable into Go binary |
+
+### Serving Strategy
+
+- **Development**: Vite dev server on `localhost:5173` with proxy to Go API on `:8080`
+- **Production**: Go binary embeds `web/dist/` via `embed.FS`, serves at `localhost:3000`
+- Single command: `finance-agent --serve` starts both API + UI
+
+### Project Structure Addition
+
+```
+finance-agent/
+├── ...existing...
+├── web/                            # Embedded UI (Vite + React)
+│   ├── package.json
+│   ├── vite.config.ts
+│   ├── tsconfig.json
+│   ├── tailwind.config.ts
+│   ├── index.html
+│   ├── src/
+│   │   ├── main.tsx
+│   │   ├── App.tsx
+│   │   ├── pages/
+│   │   │   ├── Dashboard.tsx       # Overview — CRED home style
+│   │   │   ├── Accounts.tsx        # Account list + balances
+│   │   │   ├── Transactions.tsx    # Transaction table + filters
+│   │   │   ├── Cards.tsx           # Credit card status
+│   │   │   └── Analytics.tsx       # Spend charts + trends
+│   │   ├── components/
+│   │   │   ├── AccountCard.tsx
+│   │   │   ├── TransactionRow.tsx
+│   │   │   ├── SpendChart.tsx
+│   │   │   ├── CategoryBreakdown.tsx
+│   │   │   └── CreditCardWidget.tsx
+│   │   ├── hooks/
+│   │   │   └── useApi.ts           # TanStack Query hooks
+│   │   ├── lib/
+│   │   │   └── api.ts              # API client
+│   │   └── styles/
+│   │       └── globals.css         # Tailwind imports
+│   └── dist/                       # Build output (gitignored)
+│
+├── pkg/api/                        # REST API for UI
+│   ├── server.go                   # Gin/Chi router + embed handler
+│   ├── handlers_accounts.go
+│   ├── handlers_transactions.go
+│   ├── handlers_cards.go
+│   ├── handlers_analytics.go
+│   └── middleware.go               # CORS, logging
+```
+
+### API Endpoints (served by Go)
+
+```
+GET  /api/overview              — accounts + cards + monthly summary
+GET  /api/accounts              — list all accounts
+GET  /api/accounts/:id/balance  — single account balance history
+
+GET  /api/transactions          — paginated, filterable transaction list
+     ?from=2026-06-01&to=2026-06-30&category=food&search=swiggy&page=1&limit=50
+GET  /api/transactions/stats    — spend by category, income vs expense
+
+GET  /api/cards                 — all credit cards
+GET  /api/cards/:id/spend       — card spend breakdown
+
+GET  /api/analytics/spend       — category breakdown (current month)
+GET  /api/analytics/trend       — month-over-month spend trend
+GET  /api/analytics/recurring   — recurring transactions
+
+GET  /api/sync/status           — last sync info
+POST /api/sync/trigger          — trigger manual sync from UI
+```
+
+### UI Pages
+
+**Dashboard (home)**:
+- Total balance card (all accounts summed)
+- Account cards row (each bank account with balance)
+- Credit card widget (outstanding, due date, utilization bar)
+- This month: income vs spend donut
+- Recent transactions (last 5)
+
+**Accounts**:
+- Account list with expandable details
+- Balance trend chart per account
+- Add/edit account forms
+
+**Transactions**:
+- Searchable, filterable table
+- Date range picker, category filter, amount range
+- Inline category edit (click to recategorize)
+- Pagination
+
+**Cards**:
+- Card detail view with limit/outstanding/utilization
+- Spend breakdown for current cycle
+- Bill history and due date countdown
+
+**Analytics**:
+- Category pie/bar chart
+- Monthly trend line chart (last 6 months)
+- Top merchants list
+- Recurring payments detected
+
+### Go Embedding
+
+```go
+//go:embed web/dist/*
+var webFS embed.FS
+
+func ServeUI(router *gin.Engine) {
+    static, _ := fs.Sub(webFS, "web/dist")
+    router.NoRoute(gin.WrapH(http.FileServer(http.FS(static))))
+}
+```
+
+### Build Integration (Makefile)
+
+```makefile
+build-web:
+    cd web && npm run build
+
+build: build-web
+    go build -o bin/finance-agent main.go
+
+dev-web:
+    cd web && npm run dev
+
+dev-api:
+    go run main.go --serve --dev  # API only, CORS open for vite proxy
+```
 
 ---
 
