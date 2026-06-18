@@ -1,0 +1,40 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output
+*.out
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Config (secrets)
+config.yaml
+token.json
+credentials.json
+
+# Runtime data
+data/
+statements/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Web build output
+web/dist/
+web/node_modules/

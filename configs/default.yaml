@@ -1,0 +1,40 @@
+db:
+  uri: "mongodb://localhost:27017"
+  database: "finance-agent"
+  timeout: 10s
+
+gmail:
+  credentials_file: "./credentials.json"
+  token_file: "./token.json"
+  user: "me"
+  labels: ["INBOX"]
+  sender_filters:
+    - "alerts@hdfcbank.net"
+    - "creditcards@hdfcbank.net"
+
+daemon:
+  poll_interval: 5m
+  batch_size: 50
+  health_port: 9090
+
+ai:
+  provider: "nvidia"
+  api_key_env: "NVIDIA_API_KEY"
+  model: "meta/llama-3.1-70b-instruct"
+  max_batch: 10
+
+cli:
+  theme: "default"
+  currency_symbol: "₹"
+  date_format: "02 Jan 2006"
+  confirm_prompts: true
+  verbose: false
+
+parsers:
+  default_bank: "hdfc"
+  statement_upload_dir: "./statements"
+
+categories:
+  auto_learn: true
+  min_confidence: 0.8
+  ai_threshold: 0.6
