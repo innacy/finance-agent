@@ -25,6 +25,7 @@ type replState struct {
 	printer *output.Printer
 	output  io.Writer
 	db      *db.Client
+	userID  string
 }
 
 func RunREPL(cfg *config.Config) error {
@@ -87,6 +88,12 @@ func (s *replState) dispatch(input string) DispatchResult {
 	case "exit", "quit":
 		s.cmdExit()
 		return Exit
+	case "accounts":
+		s.cmdAccounts()
+	case "balance":
+		s.cmdBalance()
+	case "overview":
+		s.cmdOverview()
 	default:
 		s.printer.Warn(fmt.Sprintf("Unknown command: %q — type 'help' for available commands", cmd))
 	}
