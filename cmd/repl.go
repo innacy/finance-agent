@@ -107,6 +107,10 @@ func (s *replState) dispatch(input string) DispatchResult {
 		s.cmdCategories()
 	case "review":
 		s.cmdReview()
+	case "brain-status":
+		s.cmdBrainStatus()
+	case "recategorize":
+		s.cmdRecategorize()
 	default:
 		s.printer.Warn(fmt.Sprintf("Unknown command: %q — type 'help' for available commands", cmd))
 	}

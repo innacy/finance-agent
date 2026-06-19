@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/innacy/finance-agent/internal/models"
+	"github.com/innacy/finance-agent/pkg/brain"
 )
 
 type DB interface {
@@ -36,10 +37,15 @@ type Categorizer struct {
 	db            DB
 	userID        string
 	minConfidence float64
+	classifier    *brain.Classifier
 }
 
 func New(db DB, userID string, minConfidence float64) *Categorizer {
 	return &Categorizer{db: db, userID: userID, minConfidence: minConfidence}
+}
+
+func NewWithML(db DB, userID string, minConfidence float64, classifier *brain.Classifier) *Categorizer {
+	return &Categorizer{db: db, userID: userID, minConfidence: minConfidence, classifier: classifier}
 }
 
 func (c *Categorizer) Categorize(ctx context.Context, input *CategorizeInput) CategorizeResult {
@@ -56,6 +62,10 @@ func (c *Categorizer) Categorize(ctx context.Context, input *CategorizeInput) Ca
 	}
 
 	if result := c.tryRules(ctx, input); result != nil {
+		return *result
+	}
+
+	if result := c.tryML(input); result != nil {
 		return *result
 	}
 
@@ -181,6 +191,25 @@ func (c *Categorizer) tryRules(ctx context.Context, input *CategorizeInput) *Cat
 	}
 
 	return nil
+}
+
+func (c *Categorizer) tryML(input *CategorizeInput) *CategorizeResult {
+	if c.classifier == nil {
+		return nil
+	}
+
+	text := strings.Join([]string{input.Merchant, input.Description, input.Channel}, " ")
+	category, confidence := c.classifier.Predict(text)
+
+	if confidence < c.minConfidence {
+		return nil
+	}
+
+	return &CategorizeResult{
+		Category:   category,
+		Confidence: confidence,
+		Method:     "ml",
+	}
 }
 
 func (c *Categorizer) tryKeywords(ctx context.Context, input *CategorizeInput) *CategorizeResult {
