@@ -21,11 +21,12 @@ const (
 )
 
 type replState struct {
-	cfg     *config.Config
-	printer *output.Printer
-	output  io.Writer
-	db      *db.Client
-	userID  string
+	cfg         *config.Config
+	printer     *output.Printer
+	output      io.Writer
+	db          *db.Client
+	userID      string
+	gmailAuthed bool
 }
 
 func RunREPL(cfg *config.Config) error {
@@ -94,6 +95,14 @@ func (s *replState) dispatch(input string) DispatchResult {
 		s.cmdBalance()
 	case "overview":
 		s.cmdOverview()
+	case "gmail-auth":
+		s.cmdGmailAuth()
+	case "sync":
+		s.cmdSync()
+	case "sync-status":
+		s.cmdSyncStatus()
+	case "txns":
+		s.cmdTxns()
 	default:
 		s.printer.Warn(fmt.Sprintf("Unknown command: %q — type 'help' for available commands", cmd))
 	}
