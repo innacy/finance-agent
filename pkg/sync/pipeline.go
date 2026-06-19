@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/innacy/finance-agent/internal/models"
+	"github.com/innacy/finance-agent/pkg/categorizer"
 	"github.com/innacy/finance-agent/pkg/gmail"
 	"github.com/innacy/finance-agent/pkg/parsers/hdfc"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -20,6 +21,11 @@ type DB interface {
 	UpsertSyncState(ctx context.Context, state *models.SyncState) error
 }
 
+type CatDB interface {
+	DB
+	categorizer.DB
+}
+
 type Result struct {
 	Processed        int
 	Created          int
@@ -32,10 +38,17 @@ type Result struct {
 type Pipeline struct {
 	db     DB
 	userID string
+	cat    *categorizer.Categorizer
+	catDB  CatDB
 }
 
 func NewPipeline(db DB, userID string) *Pipeline {
 	return &Pipeline{db: db, userID: userID}
+}
+
+func NewPipelineWithCategorizer(db CatDB, userID string, minConfidence float64) *Pipeline {
+	cat := categorizer.New(db, userID, minConfidence)
+	return &Pipeline{db: db, userID: userID, cat: cat, catDB: db}
 }
 
 func (p *Pipeline) Process(ctx context.Context, emails []gmail.RawMessage) Result {
@@ -91,6 +104,28 @@ func (p *Pipeline) Process(ctx context.Context, emails []gmail.RawMessage) Resul
 			SourceRef:       email.ID,
 			ReviewStatus:    "auto_accepted",
 			Confidence:      1.0,
+		}
+
+		if p.cat != nil {
+			merchant := parsed.Merchant
+			if merchant == "" && parsed.CounterpartyUPI != "" {
+				merchant = parsed.CounterpartyUPI
+			}
+			catResult := p.cat.Categorize(ctx, &categorizer.CategorizeInput{
+				Merchant:    merchant,
+				Description: parsed.Description,
+				Channel:     parsed.Channel,
+				Type:        parsed.Type,
+				Amount:      parsed.Amount,
+			})
+			txn.Category = catResult.Category
+			txn.SubCategory = catResult.SubCategory
+			txn.CategorizedBy = catResult.Method
+			txn.Confidence = catResult.Confidence
+
+			if catResult.Category != "Uncategorized" && merchant != "" {
+				p.cat.Learn(ctx, merchant, catResult.Category, "auto_"+catResult.Method)
+			}
 		}
 
 		if err := p.db.CreateTransaction(ctx, txn); err != nil {

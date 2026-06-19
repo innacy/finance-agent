@@ -103,6 +103,10 @@ func (s *replState) dispatch(input string) DispatchResult {
 		s.cmdSyncStatus()
 	case "txns":
 		s.cmdTxns()
+	case "categories":
+		s.cmdCategories()
+	case "review":
+		s.cmdReview()
 	default:
 		s.printer.Warn(fmt.Sprintf("Unknown command: %q — type 'help' for available commands", cmd))
 	}

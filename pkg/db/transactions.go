@@ -54,6 +54,29 @@ func (c *Client) GetTransactionsByUser(ctx context.Context, userID string, days 
 	return txns, nil
 }
 
+func (c *Client) GetPendingReviewTransactions(ctx context.Context, userID string, limit int64) ([]models.Transaction, error) {
+	filter := bson.M{
+		"user_id":       userID,
+		"review_status": "pending_review",
+	}
+
+	opts := options.Find().
+		SetSort(bson.D{{Key: "transaction_date", Value: -1}}).
+		SetLimit(limit)
+
+	cursor, err := c.database.Collection(transactionsCollection).Find(ctx, filter, opts)
+	if err != nil {
+		return nil, fmt.Errorf("finding pending review: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var txns []models.Transaction
+	if err := cursor.All(ctx, &txns); err != nil {
+		return nil, fmt.Errorf("decoding pending review: %w", err)
+	}
+	return txns, nil
+}
+
 func (c *Client) TransactionExists(ctx context.Context, userID string, accountID bson.ObjectID, date time.Time, amount float64, reference string) (bool, error) {
 	startOfDay := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, date.Location())
 	endOfDay := startOfDay.Add(24 * time.Hour)
