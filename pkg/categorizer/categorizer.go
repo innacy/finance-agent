@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/innacy/finance-agent/internal/models"
+	"github.com/innacy/finance-agent/pkg/ai"
 	"github.com/innacy/finance-agent/pkg/brain"
 )
 
@@ -38,6 +39,8 @@ type Categorizer struct {
 	userID        string
 	minConfidence float64
 	classifier    *brain.Classifier
+	aiClient      ai.AIClient
+	aiThreshold   float64
 }
 
 func New(db DB, userID string, minConfidence float64) *Categorizer {
@@ -46,6 +49,13 @@ func New(db DB, userID string, minConfidence float64) *Categorizer {
 
 func NewWithML(db DB, userID string, minConfidence float64, classifier *brain.Classifier) *Categorizer {
 	return &Categorizer{db: db, userID: userID, minConfidence: minConfidence, classifier: classifier}
+}
+
+func NewWithAI(db DB, userID string, minConfidence float64, classifier *brain.Classifier, aiClient ai.AIClient, aiThreshold float64) *Categorizer {
+	return &Categorizer{
+		db: db, userID: userID, minConfidence: minConfidence,
+		classifier: classifier, aiClient: aiClient, aiThreshold: aiThreshold,
+	}
 }
 
 func (c *Categorizer) Categorize(ctx context.Context, input *CategorizeInput) CategorizeResult {
@@ -66,6 +76,10 @@ func (c *Categorizer) Categorize(ctx context.Context, input *CategorizeInput) Ca
 	}
 
 	if result := c.tryML(input); result != nil {
+		return *result
+	}
+
+	if result := c.tryAI(ctx, input); result != nil {
 		return *result
 	}
 
@@ -191,6 +205,40 @@ func (c *Categorizer) tryRules(ctx context.Context, input *CategorizeInput) *Cat
 	}
 
 	return nil
+}
+
+func (c *Categorizer) tryAI(ctx context.Context, input *CategorizeInput) *CategorizeResult {
+	if c.aiClient == nil {
+		return nil
+	}
+
+	cats, _ := c.db.GetCategories(ctx, c.userID)
+	catNames := make([]string, 0, len(cats))
+	for _, cat := range cats {
+		catNames = append(catNames, cat.Name)
+	}
+
+	result, err := c.aiClient.CategorizeTransaction(ctx, ai.CategorizeRequest{
+		Merchant:    input.Merchant,
+		Description: input.Description,
+		Amount:      input.Amount,
+		Type:        input.Type,
+		Channel:     input.Channel,
+		Categories:  catNames,
+	})
+	if err != nil {
+		return nil
+	}
+
+	if result.Confidence < c.aiThreshold {
+		return nil
+	}
+
+	return &CategorizeResult{
+		Category:   result.Category,
+		Confidence: result.Confidence,
+		Method:     "ai",
+	}
 }
 
 func (c *Categorizer) tryML(input *CategorizeInput) *CategorizeResult {

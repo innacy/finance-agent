@@ -111,6 +111,8 @@ func (s *replState) dispatch(input string) DispatchResult {
 		s.cmdBrainStatus()
 	case "recategorize":
 		s.cmdRecategorize()
+	case "train":
+		s.cmdTrain()
 	default:
 		s.printer.Warn(fmt.Sprintf("Unknown command: %q — type 'help' for available commands", cmd))
 	}
