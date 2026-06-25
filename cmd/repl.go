@@ -9,6 +9,7 @@ import (
 
 	"github.com/chzyer/readline"
 	"github.com/innacy/finance-agent/pkg/config"
+	"github.com/innacy/finance-agent/pkg/daemon"
 	"github.com/innacy/finance-agent/pkg/db"
 	"github.com/innacy/finance-agent/pkg/output"
 )
@@ -27,6 +28,7 @@ type replState struct {
 	db          *db.Client
 	userID      string
 	gmailAuthed bool
+	daemon      *daemon.Daemon
 }
 
 func RunREPL(cfg *config.Config) error {
@@ -113,6 +115,12 @@ func (s *replState) dispatch(input string) DispatchResult {
 		s.cmdRecategorize()
 	case "train":
 		s.cmdTrain()
+	case "daemon-start":
+		s.cmdDaemonStart()
+	case "daemon-stop":
+		s.cmdDaemonStop()
+	case "daemon-status":
+		s.cmdDaemonStatus()
 	default:
 		s.printer.Warn(fmt.Sprintf("Unknown command: %q — type 'help' for available commands", cmd))
 	}
